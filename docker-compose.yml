@@ -12,6 +12,14 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # Startup recovery after a hard kill (SIGKILL): SIGTERM grace per
+      # leftover model process before SIGKILL, and the SIGKILL wait.
+      RECOVERY_TERM_GRACE_SECONDS: "3"
+      RECOVERY_KILL_GRACE_SECONDS: "5"
+      # In-container supervisor: restart the API this long after it dies, so
+      # a force-killed API comes back in the same container/PID namespace and
+      # its startup recovery can reclaim the orphaned model workers.
+      SUPERVISOR_RESTART_DELAY_SECONDS: "1"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1
@@ -30,7 +38,9 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-      start_period: 15s
+      # Recovery after a SIGKILL can take a few seconds (SIGTERM grace per
+      # leftover worker); the API only binds its port once recovery is done.
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

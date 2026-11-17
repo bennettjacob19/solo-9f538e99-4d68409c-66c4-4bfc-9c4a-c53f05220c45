@@ -4,6 +4,11 @@ Run as ``python -m app.worker_launcher ...`` in its own process group.  It
 loads the artifact, binds a loopback port, serves until terminated, and writes
 the ready handshake only once the HTTP server is actually accepting.  The API
 treats *process exit* as the only proof that a slot has been released.
+
+The very first thing this process does -- before importing heavy dependencies
+or loading the artifact -- is write ``worker.json`` into its control
+directory.  That manifest is what a future API instance uses to identify and
+reclaim this process if the current API dies without stopping it (SIGKILL).
 """
 
 from __future__ import annotations
@@ -25,6 +30,31 @@ def _write_json_atomic(path: str, payload: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     os.replace(tmp, path)
+
+
+def _write_manifest(control_dir: str, slot_id: str, version: str) -> None:
+    """Publish this worker's identity for crash-time recovery.
+
+    ``started_ticks`` is the kernel start-time token from /proc: a recycled
+    pid never has the same start time, so the recovering API can tell this
+    worker apart from an unrelated process that later reused its pid.
+    """
+    from app.recovery import MANIFEST_NAME, self_start_ticks
+
+    _write_json_atomic(
+        os.path.join(control_dir, MANIFEST_NAME),
+        {
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "pgid": os.getpgid(0),
+            "started_ticks": self_start_ticks(),
+            "control_dir": control_dir,
+            "slot_id": slot_id,
+            "version": version,
+            "instance": os.environ.get("QC_API_INSTANCE", ""),
+            "created_at": time.time(),
+        },
+    )
 
 
 async def _serve(
@@ -116,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     os.makedirs(args.control_dir, exist_ok=True)
+    # First action: make this process identifiable to a future API instance
+    # in case the current one dies before stopping us.
+    _write_manifest(args.control_dir, args.slot_id, args.version)
 
     try:
         from app.models import load_model

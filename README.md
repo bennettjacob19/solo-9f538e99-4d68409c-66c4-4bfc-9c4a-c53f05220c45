@@ -115,6 +115,65 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 * **Crashed workers are reclaimed.** If a worker dies unexpectedly, its slot
   is released and, if it was active, the service reports 503 (no active model)
   rather than routing to a dead process.
+* **A hard-killed API leaves nothing running.** If the API process itself is
+  SIGKILLed (or the box power-cycles the process), its model workers survive
+  as orphans — they would keep holding the device. The next API instance on
+  the same data directory reclaims them *before* it opens for inference or
+  new model loads. See the next section.
+
+## Crash recovery (SIGKILL the API, keep the machine clean)
+
+Every model worker writes a manifest (`workers/<slot>-<id>/worker.json`: pid,
+process group, kernel start-time token) the moment it starts, and the API
+records its registry-manager pid in `instances/<id>.json`. On startup — after
+taking the single-instance lock, before binding the HTTP port — the API:
+
+1. reads every worker manifest and instance record left in the data directory;
+2. for each recorded process, checks the live process **still matches**
+   (pid + `/proc` start-time + process group + command line). A recycled pid
+   never matches, so an unrelated process is never signalled by mistake;
+3. SIGTERMs the confirmed leftovers' process groups, waits, then SIGKILLs —
+   and only removes the on-disk record once the process is really gone;
+4. refuses to start (the container supervisor retries) if a confirmed
+   leftover cannot be stopped.
+
+Consequences, by design:
+
+* **Recovery runs to completion before inference or model loads open** —
+  uvicorn only binds the port after lifespan startup, so `GET /healthz`
+  stays down until every leftover is confirmed gone.
+* **Killed mid-recovery? The next start finishes the job.** Records are
+  deleted only after their process exits, so recovery is idempotent.
+* **Old requests are not replayed.** In-flight counters are in-memory; the
+  new instance starts at zero. Re-upload the model (`POST /admin/models`
+  with the same version id works — the registry is fresh) and infer again.
+* **Graceful stops leave nothing to recover.** Normal shutdown stops workers
+  and removes their manifests, so a clean restart's recovery is a no-op.
+* The registry-manager process (a `fork` child) is created *before* the
+  data-dir lock file is opened, so it can never inherit the lock fd — a
+  SIGKILLed API cannot wedge the lock for the next instance. Orphaned
+  managers are reclaimed from the instance records.
+
+In Docker, `app.supervisor` runs as PID 1: it restarts the API child after
+any exit (SIGKILL included) inside the same container/PID namespace, forwards
+SIGTERM for graceful `docker compose stop`, and reaps zombies (orphans
+reparent to PID 1). `docker compose restart` (whole container) works too —
+the fresh PID namespace has no leftovers, and recovery simply verifies that.
+
+### Repeatable force-kill demo
+
+```bash
+examples/kill_restart_demo.sh
+```
+
+The script (against the compose stack): uploads a model, starts a 30 s
+inference, **SIGKILLs only the API process**, shows the model worker still
+running as an orphan, waits for the supervisor to restart the API, then
+shows `GET /admin/status` reporting the reclaimed pid under `recovery` with
+all slots idle — and finishes by re-uploading a model and inferring. Safe to
+re-run; it uses fresh version ids each time. The same flow is covered
+automatically by `tests/test_recovery.py` (SIGKILL while serving, SIGKILL
+mid-load, SIGKILL mid-recovery, orphaned manager, PID-reuse safety).
 
 ## Demo scenarios
 
@@ -131,6 +190,7 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    released and the upload succeeds.
 
 `python examples/demo.py <base-url>` runs all three end to end.
+`examples/kill_restart_demo.sh` runs the force-kill recovery drill.
 
 ## Observations from the smoke runs
 
@@ -140,31 +200,44 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   (verified: 429 until the slow request finished, then `idle`).
 - SIGTERM with an in-flight request: the request completed with 200, the API
   exited 0/-15 cleanly, and no worker processes remained.
+- SIGKILL of the API with a model serving: the worker survived as an orphan;
+  the restarted API reclaimed it during startup (`recovery.reclaimed_workers`
+  in `/admin/status` listed its pid) before `healthz` came up, all slots were
+  idle, and the same version id could be re-uploaded immediately.
 
 ## Layout
 
 ```
 app/
-  main.py             API, swap orchestration, drain loop, status
+  main.py             API, swap orchestration, drain loop, startup recovery, status
   process_manager.py  shared registry/state machine + worker process handles
-  worker.py           per-versionHTTP server (one process per version)
-  worker_launcher.py  process entry point: load artifact, bind, serve, handshake
+  recovery.py         leftover-process reclaim (workers + registry manager)
+  supervisor.py       container PID 1: restart API after a kill, reap zombies
+  worker.py           per-version HTTP server (one process per version)
+  worker_launcher.py  process entry point: manifest, load artifact, bind, serve
   models.py           artifact validation, NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
   test_registry.py        state machine, claims, drain gate, crash reclaim
   test_api_integration.py real API + real worker processes
+  test_recovery.py        SIGKILL recovery: orphans, mid-recovery kill, PID reuse
 examples/
   demo.py, models/*.json
+  kill_restart_demo.sh    repeatable SIGKILL -> recover -> serve drill
 ```
 
 ## Configuration
 
 | env var | default | meaning |
 | --- | --- | --- |
-| `DATA_DIR` | `/data` | models, staging, worker control dirs, instance lock |
+| `DATA_DIR` | `/data` | models, staging, worker control dirs, instance records, lock |
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
+| `RECOVERY_TERM_GRACE_SECONDS` | `3` | SIGTERM grace per leftover process during startup recovery |
+| `RECOVERY_KILL_GRACE_SECONDS` | `5` | wait for exit after SIGKILL before startup fails |
+| `RECOVERY_RESPAWN_GRACE_SECONDS` | `1` | re-scan window for workers orphaned before their first manifest write |
+| `SUPERVISOR_RESTART_DELAY_SECONDS` | `1` | how long PID 1 waits before restarting a dead API child |
+| `SUPERVISOR_STOP_GRACE_SECONDS` | `25` | graceful-stop budget before the supervisor SIGKILLs the API |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |

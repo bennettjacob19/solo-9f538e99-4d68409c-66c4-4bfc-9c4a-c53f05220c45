@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -588,6 +589,15 @@ class WorkerHandle:
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def cleanup(self) -> None:
+        """Remove the control directory once the process is gone.
+
+        The directory carries the worker manifest used by crash recovery; it
+        must only disappear when the OS process is actually gone, otherwise a
+        restarting API could miss a still-running orphan.
+        """
+        shutil.rmtree(self.control_dir, ignore_errors=True)
 
     def wait_exit(self, timeout: float) -> bool:
         if self._proc is None:

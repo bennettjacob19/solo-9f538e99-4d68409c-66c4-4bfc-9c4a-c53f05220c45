@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import multiprocessing
 import os
@@ -34,6 +35,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
+from app import recovery
 from app.process_manager import (
     STATE_DRAINING,
     STATE_IDLE,
@@ -60,12 +62,20 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MODEL_DIR = DATA_DIR / "models"
 STAGING_DIR = DATA_DIR / "staging"
 WORK_DIR = DATA_DIR / "workers"
+INSTANCE_DIR = DATA_DIR / "instances"
 DEFAULT_TIMEOUT_MS = int(os.environ.get("DEFAULT_INFER_TIMEOUT_MS", "5000"))
 MAX_TIMEOUT_MS = 600_000
 # How long an upload may wait for a draining slot to be released before 429.
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# Startup recovery: SIGTERM grace per leftover process, then SIGKILL grace,
+# and one short re-scan window for workers orphaned before their first
+# manifest write.  Recovery always finishes (or fails startup) before the
+# service opens for inference or new model loads.
+RECOVERY_TERM_GRACE_SECONDS = float(os.environ.get("RECOVERY_TERM_GRACE_SECONDS", "3"))
+RECOVERY_KILL_GRACE_SECONDS = float(os.environ.get("RECOVERY_KILL_GRACE_SECONDS", "5"))
+RECOVERY_RESPAWN_GRACE_SECONDS = float(os.environ.get("RECOVERY_RESPAWN_GRACE_SECONDS", "1"))
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +184,8 @@ class StatusView(BaseModel):
     capacity: int
     slots: List[SlotView]
     versions: List[Dict[str, Any]]
+    instance: Optional[str] = None
+    recovery: Optional[Dict[str, Any]] = None
 
 
 class SwapResult(BaseModel):
@@ -205,49 +217,150 @@ class InferenceService:
         self._background: set[asyncio.Task] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
+        self.instance_id = uuid.uuid4().hex
+        self.recovery_report: Optional[Dict[str, Any]] = None
 
     # -- lifecycle -------------------------------------------------------
     async def startup(self) -> None:
-        for path in (DATA_DIR, MODEL_DIR, STAGING_DIR, WORK_DIR):
+        for path in (DATA_DIR, MODEL_DIR, STAGING_DIR, WORK_DIR, INSTANCE_DIR):
             path.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(DATA_DIR / "api.lock", "a+")
-        try:
-            import fcntl
-
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except ImportError:  # pragma: no cover - non-POSIX
-            pass
-        except OSError as exc:
-            raise RuntimeError(
-                "another API process already owns this data directory; the "
-                "service must run as a single process so the two-slot budget "
-                "has a single owner"
-            ) from exc
+        os.environ["QC_API_INSTANCE"] = self.instance_id  # inherited by workers
+        # The registry manager is a fork() child and inherits every fd that
+        # exists at fork time.  It must be created BEFORE the data-dir lock
+        # file is opened: if it inherited the lock fd, a SIGKILLed API would
+        # leave the lock held by the orphaned manager process and no new
+        # instance could ever start against this data directory.
         self.manager = _new_manager()
-        self.registry = Registry(self.manager)
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None),
-            limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
-        )
-        self._drain_task = asyncio.create_task(self._drain_loop())
-        bootstrap_version = os.environ.get("BOOTSTRAP_VERSION")
-        bootstrap_model = os.environ.get("BOOTSTRAP_MODEL")
-        if bootstrap_version and bootstrap_model and Path(bootstrap_model).is_file():
+        try:
+            self._lock_file = open(DATA_DIR / "api.lock", "a+")
             try:
-                await self.swap_in_path(
-                    version=bootstrap_version,
-                    source_path=bootstrap_model,
-                    expected_active=None,
-                    test_features=None,
-                    slow_load_ms=0,
-                    simulate_load_failure=False,
-                )
-                logger.info("bootstrapped model %s", bootstrap_version)
-            except Exception:
-                logger.exception(
-                    "bootstrap model %s failed; service starts without a model",
-                    bootstrap_version,
-                )
+                import fcntl
+
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except ImportError:  # pragma: no cover - non-POSIX
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    "another API process already owns this data directory; the "
+                    "service must run as a single process so the two-slot budget "
+                    "has a single owner"
+                ) from exc
+            self.registry = Registry(self.manager)
+            # Publish our own instance record *before* recovering: if we are
+            # killed mid-recovery, the next instance must be able to find and
+            # stop our (already forked) manager process.
+            self._write_instance_record()
+            # Reclaim whatever a previous, hard-killed instance left behind.
+            # This finishes -- or fails startup -- before the server accepts
+            # traffic, so inference and new model loads never run while an
+            # old model process still occupies the machine.
+            self.recovery_report = await asyncio.to_thread(self._recover_previous_instance)
+            # A killed upload can leave its staged artifact behind; no upload
+            # can be in flight now, so anything staged is garbage.
+            for stale in STAGING_DIR.iterdir():
+                if stale.is_file():
+                    with contextlib.suppress(OSError):
+                        stale.unlink()
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None),
+                limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
+            )
+            self._drain_task = asyncio.create_task(self._drain_loop())
+            bootstrap_version = os.environ.get("BOOTSTRAP_VERSION")
+            bootstrap_model = os.environ.get("BOOTSTRAP_MODEL")
+            if bootstrap_version and bootstrap_model and Path(bootstrap_model).is_file():
+                try:
+                    await self.swap_in_path(
+                        version=bootstrap_version,
+                        source_path=bootstrap_model,
+                        expected_active=None,
+                        test_features=None,
+                        slow_load_ms=0,
+                        simulate_load_failure=False,
+                    )
+                    logger.info("bootstrapped model %s", bootstrap_version)
+                except Exception:
+                    logger.exception(
+                        "bootstrap model %s failed; service starts without a model",
+                        bootstrap_version,
+                    )
+        except Exception:
+            # A failed startup must not leak the manager process.
+            if self._lock_file is not None:
+                with contextlib.suppress(Exception):
+                    self._lock_file.close()
+                self._lock_file = None
+            if self.manager is not None:
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
+                self.manager = None
+            raise
+
+    def _write_instance_record(self) -> None:
+        """Record this instance's manager process for a future recovery."""
+        manager_pid: Optional[int] = None
+        manager_ticks: Optional[int] = None
+        process = getattr(self.manager, "_process", None)
+        if process is not None:
+            manager_pid = process.pid
+        if manager_pid is not None:
+            proc = recovery.read_proc(manager_pid)
+            if proc is not None:
+                manager_ticks = proc.starttime
+        record = {
+            "instance": self.instance_id,
+            "api_pid": os.getpid(),
+            "manager_pid": manager_pid,
+            "manager_started_ticks": manager_ticks,
+            "started_at": time.time(),
+        }
+        target = INSTANCE_DIR / f"{self.instance_id}.json"
+        tmp = target.with_suffix(f".tmp.{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        os.replace(tmp, target)
+
+    def _recover_previous_instance(self) -> Dict[str, Any]:
+        """Stop leftover model workers and the old registry manager.
+
+        Runs in a worker thread during startup.  Any failure raises, which
+        aborts startup: the machine is only considered ours once every
+        leftover process from the previous instance is confirmed gone.
+        """
+        started = time.monotonic()
+        workers = recovery.recover_leftover_workers(
+            str(WORK_DIR),
+            term_grace=RECOVERY_TERM_GRACE_SECONDS,
+            kill_grace=RECOVERY_KILL_GRACE_SECONDS,
+            respawn_grace=RECOVERY_RESPAWN_GRACE_SECONDS,
+            log=logger,
+        )
+        managers = recovery.recover_instances(
+            str(INSTANCE_DIR),
+            self_instance=self.instance_id,
+            term_grace=RECOVERY_TERM_GRACE_SECONDS,
+            kill_grace=RECOVERY_KILL_GRACE_SECONDS,
+            log=logger,
+        )
+        report = {
+            "instance": self.instance_id,
+            "ran_at": time.time(),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "reclaimed_count": len(workers) + len(managers),
+            "reclaimed_workers": workers,
+            "reclaimed_managers": managers,
+        }
+        if workers or managers:
+            logger.warning(
+                "startup recovery reclaimed %d model worker(s) and %d manager(s) "
+                "from the previous instance: %s",
+                len(workers),
+                len(managers),
+                report,
+            )
+        else:
+            logger.info("startup recovery: no leftover processes from a previous instance")
+        return report
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -269,6 +382,7 @@ class InferenceService:
             task.cancel()
         for handle in list(self.handles.values()):
             await asyncio.to_thread(handle.stop, 5.0)
+            handle.cleanup()
         self.handles.clear()
         if self.client is not None:
             await self.client.aclose()
@@ -277,6 +391,8 @@ class InferenceService:
             with contextlib.suppress(Exception):
                 self.manager.shutdown()
             self.manager = None
+        with contextlib.suppress(Exception):
+            (INSTANCE_DIR / f"{self.instance_id}.json").unlink()
         if self._lock_file is not None:
             with contextlib.suppress(Exception):
                 self._lock_file.close()
@@ -333,6 +449,7 @@ class InferenceService:
         """Stop a failed candidate, wait for exit, then free its slot."""
         self.handles.pop(version, None)
         await asyncio.to_thread(handle.stop, 5.0)
+        handle.cleanup()
         self.registry.fail_candidate(version, reason)
         logger.warning("candidate %s failed: %s", version, reason)
 
@@ -590,6 +707,8 @@ class InferenceService:
                 )
                 if released:
                     self.handles.pop(version, None)
+                    if handle is not None:
+                        handle.cleanup()
                     logger.info("drained %s; slot %s released", version, slot["slot_id"])
             except Exception:
                 logger.exception("failed to drain %s", version)
@@ -598,7 +717,9 @@ class InferenceService:
 
     def _reap_dead_worker(self, version: str, info: Dict[str, Any]) -> None:
         """Reclaim bookkeeping for a worker process that died unexpectedly."""
-        self.handles.pop(version, None)
+        handle = self.handles.pop(version, None)
+        if handle is not None:
+            handle.cleanup()
         if info["state"] in (VERSION_ACTIVE, VERSION_LOADING):
             self.registry.settle_dead_worker(version)
             if self.registry.fail_active(version, "worker process exited unexpectedly"):
@@ -754,6 +875,8 @@ class InferenceService:
             versions=sorted(
                 snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
             ),
+            instance=self.instance_id,
+            recovery=self.recovery_report,
         )
 
 
@@ -803,7 +926,16 @@ app = FastAPI(
         "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
         "while the worker keeps working and keeps its slot.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
-        "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
+        "process slot's state (`loading` / `active` / `draining` / `idle`), plus "
+        "the `recovery` report from the last startup.\n\n"
+        "**Crash recovery**\n"
+        "If the API is killed hard (SIGKILL, OOM), its model workers survive as "
+        "orphans. The next instance on the same data directory terminates every "
+        "leftover worker (and the old registry manager) during startup — before "
+        "it opens for inference or new model loads — and reports what it "
+        "reclaimed under `recovery` in `/admin/status`. Old requests are not "
+        "replayed; re-upload the model to serve again. See "
+        "`examples/kill_restart_demo.sh` for a repeatable force-kill drill.\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
